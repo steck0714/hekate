@@ -22,6 +22,7 @@
 #include "gui_tools.h"
 #include "fe_emummc_tools.h"
 #include "gui_tools_partition_manager.h"
+#include "woa_fat32.h"
 #include "../hos/hos.h"
 #include <libs/fatfs/diskio.h>
 #include <libs/lvgl/lvgl.h>
@@ -47,6 +48,9 @@
 #define EMU_32GB_FULL      29856 // Actual: 29820 MB.
 #define EMU_64GB_FULL      59680 // Actual: 59640 MB.
 
+#define WOA_ESP_SIZE_MB     256   // EFI System Partition (FAT32) for Windows on ARM.
+#define WOA_MIN_USER_GB     32    // Minimum size of the Windows (NTFS) partition.
+
 #define AND_SYS_SIZE_MB     6144 // 6 GB. Fits both Legacy (4912MB) and Dynamic (6144MB) partition schemes.
 
 extern volatile boot_cfg_t *b_cfg;
@@ -68,6 +72,7 @@ typedef struct _partition_ctxt_t
 	u32 emu_size;
 	u32 l4t_size;
 	u32 and_size;
+	u32 win_size; // Windows on ARM: ESP + NTFS. 0 = disabled.
 
 	bool emu_double;
 	bool emmc_is_64gb;
@@ -93,6 +98,7 @@ typedef struct _partition_ctxt_t
 	lv_obj_t *lbl_emu;
 	lv_obj_t *lbl_l4t;
 	lv_obj_t *lbl_and;
+	lv_obj_t *lbl_win;
 
 	lv_obj_t *partition_button;
 } partition_ctxt_t;
@@ -290,15 +296,14 @@ out:
 	return res;
 }
 
-static void _create_gpt_partition(gpt_t *gpt, u8 *gpt_idx, u32 *curr_part_lba, u32 size_lba, const char *name, int name_size)
+static void _create_gpt_partition_typed(gpt_t *gpt, u8 *gpt_idx, u32 *curr_part_lba, u32 size_lba, const char *name, int name_size, const u8 *type_guid)
 {
-	static const u8 linux_part_guid[] = { 0xAF, 0x3D, 0xC6, 0x0F,  0x83, 0x84,  0x72, 0x47,  0x8E, 0x79,  0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4 };
 
 	// Reset partition.
 	memset(&gpt->entries[*gpt_idx], 0, sizeof(gpt_entry_t));
 
 	// Create GPT partition.
-	memcpy(gpt->entries[*gpt_idx].type_guid, linux_part_guid, 16);
+	memcpy(gpt->entries[*gpt_idx].type_guid, type_guid, 16);
 
 	// Set randomly created GUID.
 	u8 random_number[SE_RNG_BLOCK_SIZE];
@@ -324,6 +329,47 @@ static void _create_gpt_partition(gpt_t *gpt, u8 *gpt_idx, u32 *curr_part_lba, u
 	(*gpt_idx)++;
 }
 
+static void _create_gpt_partition(gpt_t *gpt, u8 *gpt_idx, u32 *curr_part_lba, u32 size_lba, const char *name, int name_size)
+{
+	static const u8 linux_part_guid[] = { 0xAF, 0x3D, 0xC6, 0x0F,  0x83, 0x84,  0x72, 0x47,  0x8E, 0x79,  0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4 };
+
+	_create_gpt_partition_typed(gpt, gpt_idx, curr_part_lba, size_lba, name, name_size, linux_part_guid);
+}
+
+static int _woa_sd_write(void *ctx, u32 lba, u32 cnt, const void *buf)
+{
+	// sdmmc_storage_write() returns 1 on success. The FAT32 formatter expects 0.
+	return !sdmmc_storage_write((sdmmc_storage_t *)ctx, lba, cnt, (void *)buf);
+}
+
+// Creates the Windows on ARM partitions: ESP (FAT32) + NTFS. NTFS is left empty for Windows Setup to format.
+static void _create_woa_partitions(gpt_t *gpt, u8 *gpt_idx, u32 *curr_part_lba, bool last_on_disk)
+{
+	// C12A7328-F81F-11D2-BA4B-00A0C93EC93B (EFI System Partition).
+	static const u8 esp_part_guid[] = { 0x28, 0x73, 0x2A, 0xC1,  0x1F, 0xF8,  0xD2, 0x11,  0xBA, 0x4B,  0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B };
+	// EBD0A0A2-B9E5-4433-87C0-68B6B72699C7 (Microsoft basic data).
+	static const u8 ntfs_part_guid[] = { 0xA2, 0xA0, 0xD0, 0xEB,  0xE5, 0xB9,  0x33, 0x44,  0x87, 0xC0,  0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7 };
+
+	u32 esp_sct = WOA_ESP_SIZE_MB << 11;
+	u32 ntfs_sct = (part_info.win_size << 11) - esp_sct;
+	if (last_on_disk)
+		ntfs_sct -= 0x800; // Reserve 1MB.
+
+	// ESP.
+	u32 esp_lba = *curr_part_lba;
+	_create_gpt_partition_typed(gpt, gpt_idx, curr_part_lba, esp_sct, "WOA_ESP", 14, esp_part_guid);
+
+	// Format ESP as FAT32. Scratch buffer is 64KB.
+	u8 *zbuf = malloc(0x10000);
+	u32 vol_id;
+	se_rng_pseudo((u8 *)&vol_id, sizeof(vol_id));
+	woa_fat32_format(_woa_sd_write, part_info.storage, esp_lba, esp_sct, vol_id, zbuf, 0x10000 / 512);
+	free(zbuf);
+
+	// NTFS. Left raw. Windows Setup formats it.
+	_create_gpt_partition_typed(gpt, gpt_idx, curr_part_lba, ntfs_sct, "WOA_NTFS", 16, ntfs_part_guid);
+}
+
 static void _sd_prepare_and_flash_mbr_gpt()
 {
 	mbr_t mbr;
@@ -346,11 +392,14 @@ static void _sd_prepare_and_flash_mbr_gpt()
 	se_rng_pseudo(random_number, sizeof(u32));
 	memcpy(&mbr.signature, random_number, sizeof(u32));
 
+	// GPT is needed for Android and for Windows on ARM (ESP).
+	bool need_gpt = part_info.and_size || part_info.win_size;
+
 	// FAT partition as first.
 	u8 mbr_idx = 1;
 
 	// Apply L4T Linux second to MBR if no Android.
-	if (part_info.l4t_size && !part_info.and_size)
+	if (part_info.l4t_size && !need_gpt)
 	{
 		mbr.partitions[mbr_idx].type = 0x83; // Linux system partition.
 		mbr.partitions[mbr_idx].start_sct = AU_ALIGN_SECTORS + ((u32)part_info.hos_size << 11);
@@ -363,7 +412,7 @@ static void _sd_prepare_and_flash_mbr_gpt()
 	if (part_info.emu_size)
 	{
 		mbr.partitions[mbr_idx].type = 0xE0; // emuMMC partition.
-		mbr.partitions[mbr_idx].start_sct = AU_ALIGN_SECTORS + ((u32)part_info.hos_size << 11) + (part_info.l4t_size << 11) + (part_info.and_size << 11);
+		mbr.partitions[mbr_idx].start_sct = AU_ALIGN_SECTORS + ((u32)part_info.hos_size << 11) + (part_info.l4t_size << 11) + (part_info.and_size << 11) + (part_info.win_size << 11);
 
 		if (!part_info.emu_double)
 			mbr.partitions[mbr_idx].size_sct = (part_info.emu_size << 11) - 0x800; // Reserve 1MB.
@@ -380,7 +429,7 @@ static void _sd_prepare_and_flash_mbr_gpt()
 		mbr_idx++;
 	}
 
-	if (part_info.and_size)
+	if (need_gpt)
 	{
 		gpt_t *gpt = zalloc(sizeof(gpt_t));
 		gpt_header_t gpt_hdr_backup = { 0 };
@@ -426,7 +475,7 @@ static void _sd_prepare_and_flash_mbr_gpt()
 		if (part_info.l4t_size)
 			_create_gpt_partition(gpt, &gpt_idx, &curr_part_lba, part_info.l4t_size << 11, "l4t", 6);
 
-		if (part_info.and_dynamic)
+		if (part_info.and_size && part_info.and_dynamic)
 		{
 			// Android Linux Kernel partition. 64MB.
 			_create_gpt_partition(gpt, &gpt_idx, &curr_part_lba,  0x20000, "boot", 8);
@@ -448,11 +497,11 @@ static void _sd_prepare_and_flash_mbr_gpt()
 
 			// Android Userdata partition.
 			u32 uda_size = (part_info.and_size << 11) - 0xC00000; // Subtract the other partitions (6144MB).
-			if (!part_info.emu_size)
+			if (!part_info.emu_size && !part_info.win_size)
 				uda_size -= 0x800; // Reserve 1MB.
 			_create_gpt_partition(gpt, &gpt_idx, &curr_part_lba, uda_size, "userdata", 16);
 		}
-		else
+		else if (part_info.and_size)
 		{
 			// Android Vendor partition. 1GB
 			_create_gpt_partition(gpt, &gpt_idx, &curr_part_lba, 0x200000, "vendor", 12);
@@ -482,10 +531,14 @@ static void _sd_prepare_and_flash_mbr_gpt()
 
 			// Android Userdata partition.
 			u32 uda_size = (part_info.and_size << 11) - 0x998000; // Subtract the other partitions (4912MB).
-			if (!part_info.emu_size)
+			if (!part_info.emu_size && !part_info.win_size)
 				uda_size -= 0x800; // Reserve 1MB.
 			_create_gpt_partition(gpt, &gpt_idx, &curr_part_lba, uda_size, "UDA", 6);
 		}
+
+		// Windows on ARM partitions: ESP + NTFS. Placed after Android and before emuMMC.
+		if (part_info.win_size)
+			_create_woa_partitions(gpt, &gpt_idx, &curr_part_lba, !part_info.emu_size);
 
 		// Handle emuMMC partitions manually.
 		if (part_info.emu_size)
@@ -1709,7 +1762,7 @@ static lv_res_t _sd_create_mbox_start_partitioning()
 	manual_system_maintenance(true);
 
 	// Set reserved size.
-	u32 part_rsvd_size = (part_info.emu_size << 11) + (part_info.l4t_size << 11) + (part_info.and_size << 11);
+	u32 part_rsvd_size = (part_info.emu_size << 11) + (part_info.l4t_size << 11) + (part_info.and_size << 11) + (part_info.win_size << 11);
 	part_rsvd_size += part_rsvd_size ? part_info.alignment : 0; // Do not reserve alignment space if no extra partitions.
 	disk_set_info(DRIVE_SD, SET_SECTOR_COUNT, &part_rsvd_size);
 	u8 *buf = malloc(SZ_4M);
@@ -2301,7 +2354,7 @@ static lv_res_t _action_slider_emu(lv_obj_t *slider)
 		size = 2 * max_emmc_size;
 
 	// Sanitize sizes based on new HOS size.
-	s32 hos_size = (part_info.total_sct >> 11) - 16 - size - part_info.l4t_size - part_info.and_size;
+	s32 hos_size = (part_info.total_sct >> 11) - 16 - part_info.win_size - size - part_info.l4t_size - part_info.and_size;
 	if (hos_size > part_info.hos_min_size)
 	{
 		part_info.emu_size = size;
@@ -2363,7 +2416,7 @@ static lv_res_t _action_slider_l4t(lv_obj_t *slider)
 	else if (size < 8192)
 		size = 8192;
 
-	s32 hos_size = (part_info.total_sct >> 11) - 16 - part_info.emu_size - size - part_info.and_size;
+	s32 hos_size = (part_info.total_sct >> 11) - 16 - part_info.win_size - part_info.emu_size - size - part_info.and_size;
 
 	// Sanitize sizes based on new HOS size.
 	if (hos_size > part_info.hos_min_size)
@@ -2373,8 +2426,8 @@ static lv_res_t _action_slider_l4t(lv_obj_t *slider)
 	}
 	else
 	{
-		size = (part_info.total_sct >> 11) - 16 - part_info.emu_size - part_info.and_size - 2048;
-		hos_size = (part_info.total_sct >> 11) - 16 - part_info.emu_size - part_info.and_size - size;
+		size = (part_info.total_sct >> 11) - 16 - part_info.win_size - part_info.emu_size - part_info.and_size - 2048;
+		hos_size = (part_info.total_sct >> 11) - 16 - part_info.win_size - part_info.emu_size - part_info.and_size - size;
 		if (hos_size < part_info.hos_min_size || size < 8192)
 		{
 			lv_slider_set_value(slider, part_info.l4t_size >> 10);
@@ -2409,7 +2462,7 @@ static lv_res_t _action_slider_and(lv_obj_t *slider)
 		user_size = 4096;
 
 	u32 and_size = user_size ? (user_size + AND_SYS_SIZE_MB) : 0;
-	s32 hos_size = (part_info.total_sct >> 11) - 16 - part_info.emu_size - part_info.l4t_size - and_size;
+	s32 hos_size = (part_info.total_sct >> 11) - 16 - part_info.win_size - part_info.emu_size - part_info.l4t_size - and_size;
 
 	// Sanitize sizes based on new HOS size.
 	if (hos_size > part_info.hos_min_size)
@@ -2419,8 +2472,8 @@ static lv_res_t _action_slider_and(lv_obj_t *slider)
 	}
 	else
 	{
-		and_size = (part_info.total_sct >> 11) - 16 - part_info.emu_size - part_info.l4t_size - 2048;
-		hos_size = (part_info.total_sct >> 11) - 16 - part_info.emu_size - part_info.l4t_size - and_size;
+		and_size = (part_info.total_sct >> 11) - 16 - part_info.win_size - part_info.emu_size - part_info.l4t_size - 2048;
+		hos_size = (part_info.total_sct >> 11) - 16 - part_info.win_size - part_info.emu_size - part_info.l4t_size - and_size;
 		if (hos_size < part_info.hos_min_size || and_size < 8192)
 		{
 			lv_slider_set_value(slider, part_info.and_size >> 10);
@@ -2438,6 +2491,54 @@ static lv_res_t _action_slider_and(lv_obj_t *slider)
 	lv_bar_set_value(part_info.slider_bar_hos, hos_size >> 10);
 	s_printf(lbl_text, "#FF8000 %4d GiB#", user_size >> 10);
 	lv_label_set_text(part_info.lbl_and, lbl_text);
+
+	_update_partition_bar();
+
+out:
+	return LV_RES_OK;
+}
+
+static lv_res_t _action_slider_win(lv_obj_t *slider)
+{
+	char lbl_text[64];
+
+	// Slider is the NTFS size in GiB. The ESP size is added on top.
+	u32 user_size = (u32)lv_slider_get_value(slider) << 10;
+	if (user_size < (WOA_MIN_USER_GB << 10) / 2)
+		user_size = 0;
+	else if (user_size < (WOA_MIN_USER_GB << 10))
+		user_size = WOA_MIN_USER_GB << 10;
+
+	u32 win_size = user_size ? (user_size + WOA_ESP_SIZE_MB) : 0;
+	s32 hos_size = (part_info.total_sct >> 11) - 16 - part_info.emu_size - part_info.l4t_size - part_info.and_size - win_size;
+
+	// Sanitize sizes based on new HOS size.
+	if (hos_size > part_info.hos_min_size)
+	{
+		if (user_size <= (WOA_MIN_USER_GB << 10))
+			lv_slider_set_value(slider, user_size >> 10);
+	}
+	else
+	{
+		win_size = (part_info.total_sct >> 11) - 16 - part_info.emu_size - part_info.l4t_size - part_info.and_size - 2048;
+		hos_size = (part_info.total_sct >> 11) - 16 - part_info.emu_size - part_info.l4t_size - part_info.and_size - win_size;
+		if (hos_size < part_info.hos_min_size || win_size < ((WOA_MIN_USER_GB << 10) + WOA_ESP_SIZE_MB))
+		{
+			lv_slider_set_value(slider, (part_info.win_size ? part_info.win_size - WOA_ESP_SIZE_MB : 0) >> 10);
+			goto out;
+		}
+		user_size = win_size - WOA_ESP_SIZE_MB;
+		lv_slider_set_value(slider, user_size >> 10);
+	}
+
+	part_info.win_size = win_size;
+	part_info.hos_size = hos_size;
+
+	s_printf(lbl_text, "#96FF00 %4d GiB#", hos_size >> 10);
+	lv_label_set_text(part_info.lbl_hos, lbl_text);
+	lv_bar_set_value(part_info.slider_bar_hos, hos_size >> 10);
+	s_printf(lbl_text, "#B388FF %4d GiB#", user_size >> 10);
+	lv_label_set_text(part_info.lbl_win, lbl_text);
 
 	_update_partition_bar();
 
@@ -2986,6 +3087,7 @@ lv_res_t create_window_partition_manager(bool emmc)
 	static lv_style_t bar_hos_bg, bar_emu_bg, bar_l4t_bg, bar_and_bg;
 	static lv_style_t bar_hos_ind, bar_emu_ind, bar_l4t_ind, bar_and_ind;
 	static lv_style_t bar_emu_btn, bar_l4t_btn, bar_and_btn;
+	static lv_style_t bar_win_bg, bar_win_ind, bar_win_btn;
 	static lv_style_t sep_emu_bg, sep_l4t_bg, sep_and_bg;
 
 	// Set HOS bar styles.
@@ -3035,6 +3137,17 @@ lv_res_t create_window_partition_manager(bool emmc)
 	lv_style_copy(&bar_and_btn, lv_theme_get_current()->slider.knob);
 	bar_and_btn.body.main_color = LV_COLOR_HEX(0xCC6600);
 	bar_and_btn.body.grad_color = bar_and_btn.body.main_color;
+
+	// Set Windows (WoA) bar styles.
+	lv_style_copy(&bar_win_bg, lv_theme_get_current()->bar.bg);
+	bar_win_bg.body.main_color = LV_COLOR_HEX(0x4A3A80);
+	bar_win_bg.body.grad_color = bar_win_bg.body.main_color;
+	lv_style_copy(&bar_win_ind, lv_theme_get_current()->bar.indic);
+	bar_win_ind.body.main_color = LV_COLOR_HEX(0xB388FF);
+	bar_win_ind.body.grad_color = bar_win_ind.body.main_color;
+	lv_style_copy(&bar_win_btn, lv_theme_get_current()->slider.knob);
+	bar_win_btn.body.main_color = LV_COLOR_HEX(0x9A6BFF);
+	bar_win_btn.body.grad_color = bar_win_btn.body.main_color;
 	lv_style_copy(&sep_and_bg, &sep_emu_bg);
 	sep_and_bg.body.main_color = LV_COLOR_HEX(0xFF8000);
 	sep_and_bg.body.grad_color = sep_and_bg.body.main_color;
@@ -3196,6 +3309,14 @@ lv_res_t create_window_partition_manager(bool emmc)
 	lv_label_set_static_text(lbl_and, "#FF8000 "SYMBOL_DOT" Android (USER):#");
 	lv_obj_align(lbl_and, lbl_l4t, LV_ALIGN_OUT_BOTTOM_LEFT, 0, LV_DPI / 3);
 
+	lv_obj_t *lbl_win = lbl_and;
+	if (!emmc)
+	{
+		lbl_win = lv_label_create(h1, lbl_hos);
+		lv_label_set_static_text(lbl_win, "#B388FF "SYMBOL_DOT" Windows (NTFS):#");
+		lv_obj_align(lbl_win, lbl_and, LV_ALIGN_OUT_BOTTOM_LEFT, 0, LV_DPI / 3);
+	}
+
 	// Create HOS size slider. Non-interactive.
 	lv_obj_t *slider_bar_hos = lv_bar_create(h1, NULL);
 	lv_obj_set_size(slider_bar_hos, LV_DPI * 7, LV_DPI * 3 / 17);
@@ -3243,6 +3364,20 @@ lv_res_t create_window_partition_manager(bool emmc)
 	lv_obj_align(slider_and, slider_l4t, LV_ALIGN_OUT_BOTTOM_LEFT, 0, LV_DPI / 3 - 3);
 	lv_slider_set_action(slider_and, _action_slider_and);
 
+	// Create Windows on ARM size slider. SD only. Size in GiB, ESP is added on top.
+	if (!emmc)
+	{
+		lv_obj_t *slider_win = lv_slider_create(h1, NULL);
+		lv_obj_set_size(slider_win, LV_DPI * 7, LV_DPI / 3);
+		lv_slider_set_range(slider_win, 0, (part_info.total_sct - extra_sct) / SECTORS_PER_GB - 1);
+		lv_slider_set_value(slider_win, 0);
+		lv_slider_set_style(slider_win, LV_SLIDER_STYLE_BG, &bar_win_bg);
+		lv_slider_set_style(slider_win, LV_SLIDER_STYLE_INDIC, &bar_win_ind);
+		lv_slider_set_style(slider_win, LV_SLIDER_STYLE_KNOB, &bar_win_btn);
+		lv_obj_align(slider_win, slider_and, LV_ALIGN_OUT_BOTTOM_LEFT, 0, LV_DPI / 3 - 3);
+		lv_slider_set_action(slider_win, _action_slider_win);
+	}
+
 	// Create container for the labels.
 	lv_obj_t *cont_lbl = lv_cont_create(h1, NULL);
 	lv_cont_set_fit(cont_lbl, false, true);
@@ -3280,6 +3415,16 @@ lv_res_t create_window_partition_manager(bool emmc)
 	lv_obj_align(lbl_sl_and, lbl_sl_l4t, LV_ALIGN_OUT_BOTTOM_RIGHT, 0, LV_DPI / 3);
 	part_info.lbl_and = lbl_sl_and;
 
+	// Create Windows size label.
+	part_info.lbl_win = lbl_sl_and;
+	if (!emmc)
+	{
+		lv_obj_t *lbl_sl_win = lv_label_create(cont_lbl, lbl_sl_hos);
+		lv_label_set_text(lbl_sl_win, "#B388FF    0 GiB#");
+		lv_obj_align(lbl_sl_win, lbl_sl_and, LV_ALIGN_OUT_BOTTOM_RIGHT, 0, LV_DPI / 3);
+		part_info.lbl_win = lbl_sl_win;
+	}
+
 	lv_obj_align(cont_lbl, bar_hos, LV_ALIGN_OUT_BOTTOM_LEFT, LV_DPI * 11 - LV_DPI / 2, LV_DPI * 9 / 23);
 
 	// Set partition manager notes.
@@ -3292,7 +3437,7 @@ lv_res_t create_window_partition_manager(bool emmc)
 			"Note 1: Only up to #C7EA46 1.2GB# can be backed up. If more, you will be asked to back them manually at the next step.\n"
 			"Note 2: Resized emuMMC formats the USER partition. A save data manager can be used to move them over.\n"
 			"Note 3: The #C7EA46 Flash Linux# and #C7EA46 Flash Android# will flash files if suitable partitions and installer files are found.\n");
-		lv_obj_align(lbl_notes, lbl_and, LV_ALIGN_OUT_BOTTOM_LEFT, 0, LV_DPI / 6 * 2);
+		lv_obj_align(lbl_notes, lbl_win, LV_ALIGN_OUT_BOTTOM_LEFT, 0, LV_DPI / 6 * 2);
 	}
 	else
 	{
@@ -3312,7 +3457,7 @@ lv_res_t create_window_partition_manager(bool emmc)
 		lv_obj_t *label_btn = lv_label_create(btn1, NULL);
 		lv_btn_set_fit(btn1, true, true);
 		lv_label_set_static_text(label_btn, SYMBOL_USB"  SD UMS");
-		lv_obj_align(btn1, h1, LV_ALIGN_IN_TOP_LEFT, 0, LV_DPI * 5);
+		lv_obj_align(btn1, h1, LV_ALIGN_IN_TOP_LEFT, 0, LV_DPI * 5 + LV_DPI / 3); // Shifted for the Windows slider row.
 		lv_btn_set_action(btn1, LV_BTN_ACTION_CLICK, _action_part_manager_ums_sd);
 	}
 
@@ -3363,7 +3508,7 @@ lv_res_t create_window_partition_manager(bool emmc)
 	label_btn = lv_label_create(btn1, NULL);
 	lv_btn_set_fit(btn1, true, true);
 	lv_label_set_static_text(label_btn, SYMBOL_SD"  Next Step");
-	lv_obj_align(btn1, h1, LV_ALIGN_IN_TOP_RIGHT, 0, LV_DPI * 5);
+	lv_obj_align(btn1, h1, LV_ALIGN_IN_TOP_RIGHT, 0, LV_DPI * 5 + (!emmc ? LV_DPI / 3 : 0));
 	lv_btn_set_action(btn1, LV_BTN_ACTION_CLICK, _create_mbox_partitioning_next);
 	part_info.partition_button = btn1;
 
